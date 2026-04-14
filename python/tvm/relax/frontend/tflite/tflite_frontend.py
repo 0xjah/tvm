@@ -800,7 +800,12 @@ class OperatorConverter:
             )
 
         # TFL uses only the default epsilon value
-        out = relax.op.nn.l2_normalize(in_expr, eps=1e-12, axis=[input_tensor_rank - 1])
+        # Implement L2 normalization: output = input / sqrt(sum(input^2) + eps)
+        # L2 normalization is applied along the last axis
+        squared = relax.op.square(in_expr)
+        sum_squared = relax.op.sum(squared, axis=input_tensor_rank - 1, keepdims=True)
+        denom = relax.op.sqrt(relax.op.add(sum_squared, relax.const(1e-12, "float32")))
+        out = relax.op.divide(in_expr, denom)
 
         # if we have fused activation fn
         if output_tensor.qnn_params:
@@ -839,7 +844,29 @@ class OperatorConverter:
         size = (radius * 2) + 1
         alpha = alpha * size
         axis = 3  # NHWC format
-        out = relax.op.nn.lrn(in_expr, size=size, axis=axis, bias=bias, alpha=alpha, beta=beta)
+        data_shape = to_int_list(self.get_tensor_shape(input_tensor))
+        in_type = self.get_tensor_type_str(input_tensor.tensor.Type())
+
+        # Relax currently does not expose a dedicated LRN op. Implement NHWC channel LRN
+        # by pooling squared values over the channel axis.
+        squared = self.bb.normalize(relax.op.square(in_expr))
+        squared_2d = _op.reshape(squared, [-1, data_shape[axis], 1, 1])
+        pooled = self.bb.normalize(
+            relax.op.nn.avg_pool2d(
+                squared_2d,
+                pool_size=[size, 1],
+                strides=[1, 1],
+                padding=[radius, 0, radius, 0],
+                layout="NHWC",
+                count_include_pad=True,
+            )
+        )
+        pooled = self.bb.normalize(_op.reshape(pooled, data_shape))
+        denom = relax.op.power(
+            relax.op.add(relax.const(bias, in_type), relax.op.multiply(relax.const(alpha, in_type), pooled)),
+            relax.const(beta, in_type),
+        )
+        out = relax.op.divide(in_expr, denom)
 
         return out
 
@@ -920,15 +947,35 @@ class OperatorConverter:
 
         start, limit, delta = input_tensors[0], input_tensors[1], input_tensors[2]
 
-        expressions = [self.get_tensor_expr(t) for t in [start, limit, delta]]
+        def get_scalar_value(tensor):
+            if self.has_expr(tensor.tensor_idx):
+                expr = self.get_expr(tensor.tensor_idx)
+                if isinstance(expr, relax.Constant):
+                    value = expr.data.numpy()
+                else:
+                    # relax.op.arange currently expects scalar-like values here.
+                    # Keep dynamic scalar RANGE explicit until frontend support is added.
+                    raise tvm.error.OpNotImplemented(
+                        "TFLite RANGE with dynamic scalar inputs is not supported in Relax frontend yet."
+                    )
+            else:
+                value = self.get_tensor_value(tensor)
 
+            # TFLite RANGE operands are scalar tensors in the flatbuffer.
+            assert value.size == 1, "RANGE scalar input must have exactly one element"
+            return value.item()
+
+        start_value = get_scalar_value(start)
+        limit_value = get_scalar_value(limit)
+        delta_value = get_scalar_value(delta)
+ 
         # out type inference
         if delta.tensor.Type() == TensorType.FLOAT32:
             out_type = self.get_tensor_type_str(delta.tensor.Type())
         else:
             out_type = self.get_tensor_type_str(start.tensor.Type())
 
-        out = relax.op.arange(expressions[0], expressions[1], expressions[2], out_type)
+        out = relax.op.arange(start_value, limit_value, delta_value, out_type)
 
         return out
 
@@ -937,6 +984,7 @@ class OperatorConverter:
 
         from tflite.BuiltinOptions import BuiltinOptions
         from tflite.ShapeOptions import ShapeOptions
+        from tflite.TensorType import TensorType
 
         input_tensors = self.get_input_tensors(op)
         assert len(input_tensors) == 1, "input tensors length should be 1"
@@ -946,7 +994,10 @@ class OperatorConverter:
         shape_options = ShapeOptions()
         shape_options.Init(op_options.Bytes, op_options.Pos)
 
-        out = relax.op.shape_of(self.get_tensor_expr(input_tensors[0]))
+        # SHAPE must materialize as a tensor output in Relax, not just symbolic shape info.
+        out = relax.op.shape_to_tensor(relax.op.shape_of(self.get_tensor_expr(input_tensors[0])))
+        if shape_options.OutType() == TensorType.INT32:
+            out = relax.op.astype(out, "int32")
 
         return out
 
@@ -1005,7 +1056,7 @@ class OperatorConverter:
         output_tensor = output_tensors[0]
 
         def _relu6(data):
-            return relax.op.tensor.clip(data, 0.0, 6.0)
+            return relax.op.clip(data, min=0.0, max=6.0)
 
         def _hard_swish(data):
             return data * _relu6(data + relax.const(3.0)) / relax.const(6.0)
@@ -1089,7 +1140,7 @@ class OperatorConverter:
 
         if input_tensor.qnn_params:
             in_expr = self.dequantize(in_expr, input_tensor)
-        out = relax.op.nn.leaky_relu(in_expr, alpha_tensor)
+        out = relax.op.nn.leakyrelu(in_expr, alpha_tensor)
         if output_tensor.qnn_params:
             out = self.quantize(out, output_tensor)
 
@@ -1392,7 +1443,7 @@ class OperatorConverter:
             out_f32 = relax.op.subtract(lhs_expr_f32, rhs_expr_f32)
             return self.quantize(out_f32 * out_f32, output_tensors[0])
 
-        difference = self._convert_elemwise(_op.subtract, op)
+        difference = self._convert_elemwise(op, _op.subtract)
         # _convert_elemwise has guaranteed only have one output tensor
         exp_type = self.get_tensor_type_str(self.get_output_tensors(op)[0].tensor.Type())
         out = relax.op.power(difference, relax.const(2, exp_type))
@@ -2251,8 +2302,11 @@ class OperatorConverter:
             else:
                 end[i] += begin[i]
 
-        out = relax.op.strided_slice(in_expr, begin, end)
-
+        # Create axes list for all dimensions being sliced
+        axes = list(range(input_tensor_rank))
+        begin = [int(v) for v in begin]
+        end = [int(v) for v in end]
+        out = relax.op.strided_slice(in_expr, axes=axes, begin=begin, end=end)
         return out
 
     def convert_select(self, op):
@@ -2550,7 +2604,13 @@ class OperatorConverter:
         mode_byte = mirror_pad_options.Mode()
 
         mode = "REFLECT" if mode_byte == 0 else "SYMMETRIC"
-        out = relax.op.nn.mirror_pad(in_expr, paddings, mode)
+        if mode == "SYMMETRIC":
+            raise tvm.error.OpAttributeUnImplemented(
+                "MIRROR_PAD with SYMMETRIC mode is not yet supported."
+            )
+        # Flatten tuple-of-tuples to a list for relax.op.nn.pad
+        flat_pads = [int(v) for pair in paddings for v in pair]
+        out = relax.op.nn.pad(in_expr, flat_pads, pad_mode="reflect")
 
         return out
 
@@ -2826,9 +2886,7 @@ class OperatorConverter:
             new_b_shape = [1] * max(0, rank_a - rank_b) + [int(s) for s in shape_b]
             max_rank = max(rank_a, rank_b)
 
-            batch_shape = [
-                max(new_a_shape[i], new_b_shape[i]) for i in range(max_rank - 2)
-            ]
+            batch_shape = [max(new_a_shape[i], new_b_shape[i]) for i in range(max_rank - 2)]
 
             a_broadcast = batch_shape + [int(shape_a[-2]), int(shape_a[-1])]
             b_broadcast = batch_shape + [int(shape_b[-2]), int(shape_b[-1])]
@@ -2897,7 +2955,14 @@ class OperatorConverter:
         depth_to_space_options = DepthToSpaceOptions()
         depth_to_space_options.Init(op_options.Bytes, op_options.Pos)
         block_size = depth_to_space_options.BlockSize()
-        out = relax.op.nn.depth_to_space(in_expr, block_size, layout="NHWC")
+
+        # TFLite uses NHWC layout: (N, H, W, C) -> (N, H*bs, W*bs, C/(bs*bs))
+        input_shape = self.get_tensor_shape(input_tensor)
+        n, h, w, c = input_shape
+        out_c = c // (block_size**2)
+        out = relax.op.reshape(in_expr, (n, h, w, block_size, block_size, out_c))
+        out = relax.op.permute_dims(out, [0, 1, 3, 2, 4, 5])
+        out = relax.op.reshape(out, (n, h * block_size, w * block_size, out_c))
 
         return out
 
@@ -2918,7 +2983,17 @@ class OperatorConverter:
         space_to_depth_options = SpaceToDepthOptions()
         space_to_depth_options.Init(op_options.Bytes, op_options.Pos)
         block_size = space_to_depth_options.BlockSize()
-        out = relax.op.nn.space_to_depth(in_expr, block_size, layout="NHWC")
+
+        # TFLite uses NHWC layout: (N, H, W, C) -> (N, H/bs, W/bs, C*bs*bs)
+        input_shape = self.get_tensor_shape(input_tensor)
+        n, h, w, c = input_shape
+        out = relax.op.reshape(
+            in_expr, (n, h // block_size, block_size, w // block_size, block_size, c)
+        )
+        out = relax.op.permute_dims(out, [0, 1, 3, 2, 4, 5])
+        out = relax.op.reshape(
+            out, (n, h // block_size, w // block_size, c * block_size * block_size)
+        )
 
         return out
 
@@ -2956,21 +3031,11 @@ class OperatorConverter:
 
         input_tensor = input_tensors[0]
         alpha_tensor = input_tensors[1]
-        if self.has_expr(alpha_tensor.tensor_idx):
-            alpha_expr = self.get_expr(alpha_tensor.tensor_idx)
-        else:
-            alpha_tensor_type = alpha_tensor.tensor.Type()
-            alpha_tensor_type_str = self.get_tensor_type_str(alpha_tensor_type)
-            alpha_expr = self.exp_tab.new_const(
-                self.get_tensor_value(alpha_tensor),
-                dtype=alpha_tensor_type_str,
-                source_name=alpha_tensor.tensor.Name(),
-            )
-        in_expr = self.get_expr(input_tensor.tensor_idx)
         data_shape = to_int_list(self.get_tensor_shape(input_tensor))
-
-        alpha_expr = relax.op.broadcast_to(alpha_expr, data_shape)
-        alpha_expr = relax.op.reshape(alpha_expr, [-1])
+        in_expr = self.get_tensor_expr(input_tensor)
+        alpha_expr = self.get_tensor_expr(alpha_tensor)
+        alpha_expr = self.bb.normalize(relax.op.broadcast_to(alpha_expr, data_shape))
+        alpha_expr = self.bb.normalize(relax.op.reshape(alpha_expr, [-1]))
         out = relax.op.nn.prelu(_op.reshape(in_expr, [-1]), alpha_expr, axis=0)
         out = relax.op.reshape(out, data_shape)
         return out
@@ -3089,8 +3154,6 @@ class OperatorConverter:
                 weight_expr_iohw,
                 strides=(stride_h, stride_w),
                 padding=padding,
-                channels=int(out_channels),
-                kernel_size=(int(kernel_h), int(kernel_w)),
                 data_layout="NHWC",
                 kernel_layout="IOHW",
                 out_dtype=output_tensor_type_str,
@@ -3204,16 +3267,49 @@ class OperatorConverter:
 
     def convert_detection_postprocess(self, op):
         """Convert TFLite_Detection_PostProcess"""
-        raise NotImplementedError(
-            "DETECTION_POSTPROCESS is not wired in this frontend yet: it still needs "
-            "Relax NMS / get_valid_counts / related vision helpers (see dead code below). "
-            "relax.vision.multibox_transform_loc exists; tracking: "
-            "https://github.com/apache/tvm/issues/18928"
-        )
         flexbuffer = op.CustomOptionsAsNumpy().tobytes()
         custom_options = FlexBufferDecoder(flexbuffer).decode()
 
-        use_regular_nms = "use_regular_nms" in custom_options and custom_options["use_regular_nms"]
+        use_regular_nms = bool(custom_options.get("use_regular_nms", False))
+
+        required_attrs = [
+            "num_classes",
+            "max_detections",
+            "detections_per_class",
+            "nms_iou_threshold",
+            "nms_score_threshold",
+            "x_scale",
+            "y_scale",
+            "w_scale",
+            "h_scale",
+        ]
+        missing_attrs = [key for key in required_attrs if key not in custom_options]
+        if missing_attrs:
+            raise ValueError(
+                "DETECTION_POSTPROCESS custom options miss required attributes: "
+                + ", ".join(missing_attrs)
+            )
+
+        num_classes = int(custom_options["num_classes"])
+        max_detections = int(custom_options["max_detections"])
+        detections_per_class = int(custom_options["detections_per_class"])
+        iou_threshold = float(custom_options["nms_iou_threshold"])
+        score_threshold = float(custom_options["nms_score_threshold"])
+        x_scale = float(custom_options["x_scale"])
+        y_scale = float(custom_options["y_scale"])
+        w_scale = float(custom_options["w_scale"])
+        h_scale = float(custom_options["h_scale"])
+
+        if num_classes <= 0:
+            raise ValueError("DETECTION_POSTPROCESS requires num_classes > 0.")
+        if max_detections <= 0:
+            raise ValueError("DETECTION_POSTPROCESS requires max_detections > 0.")
+        if detections_per_class <= 0:
+            raise ValueError("DETECTION_POSTPROCESS requires detections_per_class > 0.")
+        if not 0.0 <= iou_threshold <= 1.0:
+            raise ValueError("DETECTION_POSTPROCESS requires nms_iou_threshold in [0, 1].")
+        if x_scale <= 0.0 or y_scale <= 0.0 or w_scale <= 0.0 or h_scale <= 0.0:
+            raise ValueError("DETECTION_POSTPROCESS requires x/y/w/h_scale to be > 0.")
 
         inputs = self.get_input_tensors(op)
         assert len(inputs) == 3, "inputs length should be 3"
@@ -3275,75 +3371,147 @@ class OperatorConverter:
         # attributes for multibox_transform_loc
         multibox_transform_loc_attrs = {}
         multibox_transform_loc_attrs["clip"] = False
-        multibox_transform_loc_attrs["threshold"] = (
-            0.0 if use_regular_nms else custom_options["nms_score_threshold"]
-        )
+        multibox_transform_loc_attrs["threshold"] = 0.0 if use_regular_nms else score_threshold
         multibox_transform_loc_attrs["variances"] = (
-            1 / custom_options["x_scale"],
-            1 / custom_options["y_scale"],
-            1 / custom_options["w_scale"],
-            1 / custom_options["h_scale"],
+            1 / x_scale,
+            1 / y_scale,
+            1 / w_scale,
+            1 / h_scale,
         )
         multibox_transform_loc_attrs["keep_background"] = use_regular_nms
 
-        ret = relax.op.vision.multibox_transform_loc(
-            # reshape cls_pred so it can be consumed by
-            # multibox_transform_loc
-            relax.op.permute_dims(cls_pred, [0, 2, 1]),
-            loc_prob,
-            anchor_expr,
-            **multibox_transform_loc_attrs,
+        multibox_res = self.bb.emit(
+            relax.op.vision.multibox_transform_loc(
+                # reshape cls_pred so it can be consumed by
+                # multibox_transform_loc
+                relax.op.permute_dims(cls_pred, [0, 2, 1]),
+                loc_prob,
+                anchor_expr,
+                **multibox_transform_loc_attrs,
+            )
+        )
+        transformed_boxes = self.bb.emit(relax.TupleGetItem(multibox_res, 0))
+        transformed_scores = self.bb.emit(relax.TupleGetItem(multibox_res, 1))
+
+        if use_regular_nms:
+            nms_out = self.bb.emit(
+                relax.op.vision.all_class_non_max_suppression(
+                    transformed_boxes,
+                    transformed_scores,
+                    relax.const(detections_per_class, "int64"),
+                    relax.const(iou_threshold, "float32"),
+                    relax.const(score_threshold, "float32"),
+                    output_format="tensorflow",
+                )
+            )
+            selected_indices = self.bb.emit(relax.TupleGetItem(nms_out, 0))
+            selected_scores = self.bb.emit(relax.TupleGetItem(nms_out, 1))
+            num_detections = self.bb.emit(relax.TupleGetItem(nms_out, 2))
+            class_id_from_score = None
+        else:
+            topk_res = self.bb.emit(
+                relax.op.topk(transformed_scores, k=1, axis=1, ret_type="both", largest=True)
+            )
+            max_scores = self.bb.emit(relax.TupleGetItem(topk_res, 0))
+            class_id_from_score = self.bb.emit(relax.TupleGetItem(topk_res, 1))
+            nms_out = self.bb.emit(
+                relax.op.vision.all_class_non_max_suppression(
+                    transformed_boxes,
+                    max_scores,
+                    relax.const(max_detections, "int64"),
+                    relax.const(iou_threshold, "float32"),
+                    relax.const(score_threshold, "float32"),
+                    output_format="tensorflow",
+                )
+            )
+            selected_indices = self.bb.emit(relax.TupleGetItem(nms_out, 0))
+            selected_scores = self.bb.emit(relax.TupleGetItem(nms_out, 1))
+            num_detections = self.bb.emit(relax.TupleGetItem(nms_out, 2))
+            class_id_from_score = relax.op.squeeze(class_id_from_score, axis=[1])
+
+        selected_score_slots = selected_scores.struct_info.shape.values[1]
+        selected_detection_positions = relax.op.expand_dims(
+            relax.op.arange(selected_score_slots, dtype="int64"), axis=0
+        )
+        selected_valid_detection_mask = relax.op.less(
+            selected_detection_positions, relax.op.expand_dims(num_detections, axis=1)
+        )
+        masked_selected_scores = relax.op.where(
+            selected_valid_detection_mask,
+            selected_scores,
+            relax.const(-1.0, "float32"),
+        )
+        topk_scores_res = self.bb.emit(
+            relax.op.topk(
+                masked_selected_scores, k=max_detections, axis=1, ret_type="both", largest=True
+            )
+        )
+        detection_scores = self.bb.emit(relax.TupleGetItem(topk_scores_res, 0))
+        top_positions = self.bb.emit(relax.TupleGetItem(topk_scores_res, 1))
+        num_detections = relax.op.minimum(
+            num_detections, relax.const([max_detections], dtype="int64")
+        )
+        detection_positions = relax.op.expand_dims(
+            relax.op.arange(max_detections, dtype="int64"), axis=0
+        )
+        valid_detection_mask = relax.op.less(
+            detection_positions, relax.op.expand_dims(num_detections, axis=1)
+        )
+        top_positions_expanded = relax.op.expand_dims(top_positions, axis=2)
+        top_positions_for_pairs = relax.op.repeat(top_positions_expanded, 2, axis=2)
+        top_index_pairs = relax.op.gather_elements(
+            selected_indices, top_positions_for_pairs, axis=1
+        )
+        top_box_ids = relax.op.squeeze(
+            relax.op.strided_slice(top_index_pairs, axes=[2], begin=[1], end=[2]),
+            axis=[2],
+        )
+        top_box_ids_for_gather = relax.op.expand_dims(relax.op.astype(top_box_ids, "int64"), axis=2)
+        detection_boxes = relax.op.gather_nd(
+            transformed_boxes, top_box_ids_for_gather, batch_dims=1
         )
 
         if use_regular_nms:
-            # box coordinates need to be converted from ltrb to (ymin, xmin, ymax, xmax)
-            _, transformed_boxes = relax.op.split(ret[0], (2,), axis=2)
-            box_l, box_t, box_r, box_b = relax.op.split(transformed_boxes, 4, axis=2)
-            transformed_boxes = relax.op.concat([box_t, box_l, box_b, box_r], axis=2)
-
-            return relax.op.vision.regular_non_max_suppression(
-                boxes=transformed_boxes,
-                scores=cls_pred,
-                max_detections_per_class=custom_options["detections_per_class"],
-                max_detections=custom_options["max_detections"],
-                num_classes=custom_options["num_classes"],
-                iou_threshold=custom_options["nms_iou_threshold"],
-                score_threshold=custom_options["nms_score_threshold"],
+            detection_classes = relax.op.squeeze(
+                relax.op.strided_slice(top_index_pairs, axes=[2], begin=[0], end=[1]),
+                axis=[2],
+            )
+            detection_classes = relax.op.astype(detection_classes, "int32")
+        else:
+            top_box_ids_for_class = relax.op.expand_dims(
+                relax.op.astype(top_box_ids, "int64"), axis=2
+            )
+            detection_classes = relax.op.gather_nd(
+                class_id_from_score, top_box_ids_for_class, batch_dims=1
             )
 
-        # attributes for non_max_suppression
-        non_max_suppression_attrs = {}
-        non_max_suppression_attrs["return_indices"] = False
-        non_max_suppression_attrs["iou_threshold"] = custom_options["nms_iou_threshold"]
-        non_max_suppression_attrs["force_suppress"] = True
-        non_max_suppression_attrs["top_k"] = anchor_boxes
-        non_max_suppression_attrs["max_output_size"] = custom_options["max_detections"]
-        non_max_suppression_attrs["invalid_to_bottom"] = False
-
-        ret = relax.op.vision.non_max_suppression(
-            ret[0], ret[1], ret[1], **non_max_suppression_attrs
+        detection_mask = relax.op.expand_dims(valid_detection_mask, axis=2)
+        detection_boxes = relax.op.where(
+            detection_mask,
+            detection_boxes,
+            relax.op.zeros((batch_size, max_detections, 4), dtype="float32"),
         )
-        ret = relax.op.vision.get_valid_counts(ret, 0)
-        valid_count = ret[0]
-        # keep only the top 'max_detections' rows
-        ret = relax.op.strided_slice(
-            ret[1], [0, 0, 0], [batch_size, custom_options["max_detections"], 6]
+        detection_classes = relax.op.where(
+            valid_detection_mask,
+            detection_classes,
+            relax.op.zeros((batch_size, max_detections), dtype="int32"),
         )
-        # the output needs some reshaping to match tflite
-        ret = relax.op.split(ret, 6, axis=2)
-        cls_ids = relax.op.reshape(ret[0], [batch_size, -1])
-        scores = relax.op.reshape(ret[1], [batch_size, -1])
-        boxes = relax.op.concat([ret[3], ret[2], ret[5], ret[4]], axis=2)
-        ret = relax.Tuple(relax.Tuple([boxes, cls_ids, scores, valid_count]), size=4)
-        return ret
+        detection_scores = relax.op.where(
+            valid_detection_mask,
+            detection_scores,
+            relax.op.zeros((batch_size, max_detections), dtype="float32"),
+        )
+        detection_classes = relax.op.astype(detection_classes, "float32")
+        num_detections = relax.op.astype(num_detections, "float32")
+        return relax.Tuple([detection_boxes, detection_classes, detection_scores, num_detections])
 
     def convert_nms_v5(self, op):
         """Convert TFLite NonMaxSuppressionV5"""
         input_tensors = self.get_input_tensors(op)
         assert len(input_tensors) == 6, "input tensor length should be 6"
 
-        boxes = self.get_tensor_expr(input_tensors[0]) 
-        scores = self.get_tensor_expr(input_tensors[1]) 
+        boxes = self.get_tensor_expr(input_tensors[0])
+        scores = self.get_tensor_expr(input_tensors[1])
 
         max_output_size = self.get_tensor_value(input_tensors[2])
         iou_threshold = self.get_tensor_value(input_tensors[3])
@@ -3397,14 +3565,16 @@ class OperatorConverter:
         )
 
         selected_indices = relax.op.squeeze(nms_ret[0], axis=[0])
-        selected_indices = relax.op.strided_slice(selected_indices, axes=[0], begin=[0], end=[max_output_size])
-        num_valid = relax.op.reshape(nms_ret[1], [])   
+        selected_indices = relax.op.strided_slice(
+            selected_indices, axes=[0], begin=[0], end=[max_output_size]
+        )
+        num_valid = relax.op.reshape(nms_ret[1], [])
 
         # Clamp out-of-bound padded indices to prevent take() crash.
         num_boxes = int(self.get_tensor_shape(input_tensors[0])[0])
         safe_indices = relax.op.clip(selected_indices, min=0, max=num_boxes - 1)
         selected_scores = relax.op.take(scores, safe_indices, axis=0)
-        
+
         out = relax.Tuple([selected_indices, selected_scores, num_valid])
         return out
 
@@ -3425,7 +3595,7 @@ class OperatorConverter:
         axis = self.get_tensor_value(input_tensors[1])
         if isinstance(axis, np.ndarray):
             assert axis.size == 1, "only one value is expected."
-            axis = int(axis)
+            axis = int(axis.flat[0])
 
         ndims = len(input_tensors[0].tensor.ShapeAsNumpy())
         assert -1 - ndims <= axis <= ndims, "axis out of range"
@@ -3457,10 +3627,8 @@ class OperatorConverter:
             "on_value and off_value should be the same type"
         )
 
-        # Getting relax expr
+        # Getting relax expr for indices
         indices_expr = self.get_expr(indices.tensor_idx)
-        on_value_expr = self.get_expr(on_value.tensor_idx)
-        off_value_expr = self.get_expr(off_value.tensor_idx)
 
         # Getting depth value
         depth = self.get_tensor_value(depth)
@@ -3474,10 +3642,18 @@ class OperatorConverter:
         one_hot_options.Init(op_options.Bytes, op_options.Pos)
         axis = one_hot_options.Axis()
 
-        # Setting dtype
+        # Extract scalar values for on_value and off_value and wrap as PrimValue
         dtype = self.get_tensor_type_str(on_value.tensor.Type())
+        on_val = self.get_tensor_value(on_value).item()
+        off_val = self.get_tensor_value(off_value).item()
+        if "float" in dtype:
+            on_prim = relax.PrimValue(tvm.tirx.FloatImm(dtype, float(on_val)))
+            off_prim = relax.PrimValue(tvm.tirx.FloatImm(dtype, float(off_val)))
+        else:
+            on_prim = relax.PrimValue(tvm.tirx.IntImm(dtype, int(on_val)))
+            off_prim = relax.PrimValue(tvm.tirx.IntImm(dtype, int(off_val)))
 
-        out = relax.op.one_hot(indices_expr, on_value_expr, off_value_expr, depth, axis, dtype)
+        out = relax.op.one_hot(indices_expr, on_prim, off_prim, depth, axis)
 
         return out
 
@@ -3492,9 +3668,9 @@ class OperatorConverter:
         axis = self.get_tensor_value(input_tensors[1])
         if isinstance(axis, np.ndarray):
             assert len(axis) == 1, "TFLite does not support multi-axis yet"
-            axis = int(axis)
+            axis = int(axis.flat[0])
 
-        out = relax.op.reverse(input_expr, axis)
+        out = relax.op.flip(input_expr, axis)
         return out
 
     def convert_matrix_set_diag(self, op):
@@ -3925,7 +4101,7 @@ def _input_type(model):
     for subgraph_index in range(subgraph_count):
         subgraph = model.Subgraphs(subgraph_index)
         inputs_count = subgraph.InputsLength()
-        assert inputs_count >= 1
+        # TFLite subgraphs can validly have zero inputs (e.g. constant-only RANGE models).
         for input_index in range(inputs_count):
             input_ = subgraph.Inputs(input_index)
             assert subgraph.TensorsLength() > input_
@@ -4079,7 +4255,9 @@ def from_tflite(
             op_converter.convert_op_to_relax()
 
             # params and outputs
-            outputs = [exp_tab.get_expr(get_tensor_name(subgraph, i)) for i in model_outputs]
+            # Resolve outputs through tensor wrappers so constant/prefetched outputs are handled.
+            output_tensors = op_converter.get_tensors(model_outputs)
+            outputs = [op_converter.get_tensor_expr(tensor) for tensor in output_tensors]
             outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
             output_var = bb.emit_output(outputs)
 

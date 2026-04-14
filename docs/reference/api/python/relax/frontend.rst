@@ -29,6 +29,12 @@ tvm.relax.frontend.nn
    :exclude-members: BlockBuilder
    :noindex:
 
+tvm.relax.frontend.nn.llm
+*************************
+.. automodule:: tvm.relax.frontend.nn.llm
+   :members:
+   :no-index:
+
 tvm.relax.frontend.onnx
 ***********************
 .. automodule:: tvm.relax.frontend.onnx

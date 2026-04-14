@@ -302,13 +302,82 @@ class OnnxOpConverter:
         converter, which should be `_impl_vx`. Number x is the biggest
             number smaller than or equal to opset belongs to all support versions.
         """
-        versions = [int(d.replace("_impl_v", "")) for d in dir(cls) if "_impl_v" in d]
-        versions = sorted(versions + [opset])
-        version = versions[max([i for i, v in enumerate(versions) if v == opset]) - 1]
+        impl_versions = sorted(int(d.replace("_impl_v", "")) for d in dir(cls) if "_impl_v" in d)
+        # Select the largest implemented version that is <= opset.
+        # If opset is below all implementations, fall back to the smallest.
+        candidates = [v for v in impl_versions if v <= opset]
+        version = max(candidates) if candidates else impl_versions[0]
         if hasattr(cls, f"_impl_v{version}"):
             return getattr(cls, f"_impl_v{version}")
         raise NotImplementedError(f"opset version {version} of {cls.__name__} not implemented")
 
+class QuantizeLinear(OnnxOpConverter):
+    @classmethod
+    def _impl_v10(cls, bb, inputs, attr, params):
+        x, scale = inputs[0], inputs[1]
+        zp = inputs[2] if len(inputs) > 2 and inputs[2] is not None else None
+        axis = attr.get("axis", 1)
+        if hasattr(x.struct_info, "ndim") and x.struct_info.ndim <= 1 and axis == 1:
+            axis = 0
+        out_dtype = "uint8" if zp is None else zp.struct_info.dtype
+        if zp is None:
+            zp = relax.const(0, out_dtype)
+        return relax.op.quantize(x, scale, zp, axis=axis, out_dtype=out_dtype)
+
+    @classmethod
+    def _impl_v13(cls, bb, inputs, attr, params):
+        x, scale = inputs[0], inputs[1]
+        zp = inputs[2] if len(inputs) > 2 and inputs[2] is not None else None
+        axis = attr.get("axis", 1)
+        if hasattr(x.struct_info, "ndim") and x.struct_info.ndim <= 1 and axis == 1:
+            axis = 0
+        out_dtype = "uint8" if zp is None else zp.struct_info.dtype
+        if zp is None:
+            zp = relax.const(0, out_dtype)
+        return relax.op.quantize(x, scale, zp, axis=axis, out_dtype=out_dtype)
+
+
+class DequantizeLinear(OnnxOpConverter):
+    @classmethod
+    def _impl_v10(cls, bb, inputs, attr, params):
+        x, scale = inputs[0], inputs[1]
+        zp = inputs[2] if len(inputs) > 2 and inputs[2] is not None else None
+        axis = attr.get("axis", 1)
+        if hasattr(x.struct_info, "ndim") and x.struct_info.ndim <= 1 and axis == 1:
+            axis = 0
+        if zp is None:
+            zp = relax.const(0, x.struct_info.dtype)
+        return relax.op.dequantize(x, scale, zp, axis=axis, out_dtype="float32")
+
+    @classmethod
+    def _impl_v13(cls, bb, inputs, attr, params):
+        x, scale = inputs[0], inputs[1]
+        zp = inputs[2] if len(inputs) > 2 and inputs[2] is not None else None
+        axis = attr.get("axis", 1)
+        if hasattr(x.struct_info, "ndim") and x.struct_info.ndim <= 1 and axis == 1:
+            axis = 0
+        if zp is None:
+            zp = relax.const(0, x.struct_info.dtype)
+        return relax.op.dequantize(x, scale, zp, axis=axis, out_dtype="float32")
+
+
+class DynamicQuantizeLinear(OnnxOpConverter):
+    @classmethod
+    def _impl_v11(cls, bb, inputs, attr, params):
+        x = inputs[0]
+        x_dtype = x.struct_info.dtype
+        qmin = relax.const(0, x_dtype)
+        qmax = relax.const(255, x_dtype)
+
+        x_max = relax.op.maximum(qmin, relax.op.max(x))
+        x_min = relax.op.minimum(qmin, relax.op.min(x))
+        y_scale = relax.op.divide(relax.op.subtract(x_max, x_min), qmax)
+
+        zp_fp = relax.op.subtract(qmin, relax.op.divide(x_min, y_scale))
+        y_zero_point = relax.op.astype(relax.op.round(relax.op.clip(zp_fp, 0, 255)), "uint8")
+
+        y = relax.op.quantize(x, y_scale, y_zero_point, axis=0, out_dtype="uint8")
+        return relax.Tuple([y, y_scale, y_zero_point])
 
 class MatMul(OnnxOpConverter):
     """Converts an onnx MatMul node into an equivalent Relax expression."""
@@ -1086,6 +1155,11 @@ class Clip(OnnxOpConverter):
         results = bb.emit_te(topi.maximum, results, min)
         results = bb.emit_te(topi.minimum, results, max)
         return results
+
+    @classmethod
+    def _impl_v11(cls, bb, inputs, attr, params):
+        # Opset 11 changed Clip from attribute-based min/max to input-based.
+        return cls._impl_v13(bb, inputs, attr, params)
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
@@ -3769,13 +3843,13 @@ def _argreduce_select_last_index(bb, data, axis, keepdims, op):
         offset = relax.const(int(axis_size) - 1, "int64")
     else:
         # dynamic: get axis size at runtime and subtract 1
-        shape_tensor = bb.normalize(relax.op.shape_to_tensor(
-            bb.normalize(relax.op.shape_of(data))
-        ))
-        offset = bb.normalize(relax.op.subtract(
-            bb.normalize(relax.op.take(shape_tensor, relax.const(axis, "int64"), axis=0)),
-            relax.const(1, "int64"),
-        ))
+        shape_tensor = bb.normalize(relax.op.shape_to_tensor(bb.normalize(relax.op.shape_of(data))))
+        offset = bb.normalize(
+            relax.op.subtract(
+                bb.normalize(relax.op.take(shape_tensor, relax.const(axis, "int64"), axis=0)),
+                relax.const(1, "int64"),
+            )
+        )
     return relax.op.subtract(offset, flipped_idx)
 
 
@@ -4353,7 +4427,7 @@ class SplitToSequence(OnnxOpConverter):
                 for i in range(n)
             ]
             return relax.Tuple(squeezed)
-        
+
         return output
 
 
@@ -4805,6 +4879,10 @@ def _get_convert_map():
         "ConcatFromSequence": ConcatFromSequence,
         "SplitToSequence": SplitToSequence,
         "SequenceAt": SequenceAt,
+        # Quantization
+        "QuantizeLinear": QuantizeLinear,
+        "DequantizeLinear": DequantizeLinear,
+        "DynamicQuantizeLinear": DynamicQuantizeLinear,
     }
 
 
